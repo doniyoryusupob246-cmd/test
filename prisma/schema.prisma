@@ -1,0 +1,97 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            Int            @id @default(autoincrement())
+  telegramId    String         @unique
+  chatId        String
+  firstName     String?
+  lastName      String?
+  updateAt      DateTime       @updatedAt
+  username      String?
+  // blacklist     BlackList[]
+  filters       Filter[]
+  notifications Notification[]
+
+  createAt DateTime @default(now())
+}
+
+model Filter {
+  id            Int            @id @default(autoincrement())
+  userId        Int
+  createAt      DateTime       @default(now())
+  updateAt      DateTime       @updatedAt
+  criteria      Json
+  isActive      Boolean
+  name          String?
+  type          String
+  user          User           @relation(fields: [userId], references: [id])
+  notifications Notification[]
+}
+
+model Listing {
+  id           Int     @id @default(autoincrement())
+  olxId        String  @unique
+  title        String
+  url          String
+  price        String
+  priceNumeric Float
+  description  String
+  rayon        String?
+  district     String?
+  city         String?
+  region       String?
+  lat          Float?
+  lon          Float?
+  image        String?
+  rooms        Int?
+  area         Float? // Добавь это поле
+  floor        Int?
+  totalFloors  Int?
+  type         String? // 'rent' или 'sale'
+
+  // Новое поле для матчинга
+  isMatched Boolean @default(false)
+
+  createdAt    DateTime
+  updatedAt    DateTime  @updatedAt
+  lastSeenAt   DateTime?
+  priceHistory Json
+
+  notifications Notification[]
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  filterId  Int?
+  listingId Int?
+  sentAt    DateTime @default(now())
+  filter    Filter?  @relation(fields: [filterId], references: [id])
+  user      User?    @relation(fields: [userId], references: [id])
+  listing   Listing? @relation(fields: [listingId], references: [id])
+
+  @@unique([userId, listingId])
+}
+
+// model BlackList {
+//   id        Int      @id @default(autoincrement())
+//   userId    Int
+//   listingId Int?
+//   sellerId  String?
+//   createdAt DateTime @default(now())
+//   listing   Listing? @relation(fields: [listingId], references: [id])
+//   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+//   @@unique([userId, listingId])
+// }

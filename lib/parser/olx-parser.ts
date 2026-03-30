@@ -1,0 +1,308 @@
+import { prisma } from '@/lib/prisma';
+
+const OLX_API = 'https://olx.uz/api/v1/offers/';
+
+// Категории OLX (аренда квартир / продажа квартир)
+const CATEGORIES = {
+  rent: 1511,   // Сдам — квартиры
+  sale: 1510,   // Продам — квартиры
+};
+
+// ─── Типы ──────────────────────────────────────────────────────────────────
+
+interface OlxParam {
+  key: string;
+  value?: {
+    key?: string | number;
+    label?: string;
+  };
+}
+
+interface OlxItem {
+  id: number;
+  title: string;
+  url: string;
+  description?: string;
+  params?: OlxParam[];
+  location?: {
+    city?: { name?: string };
+    region?: { name?: string };
+    district?: { name?: string };
+  };
+  map?: { lat?: number; lon?: number };
+  photos?: { link?: string }[];
+  created_time?: string;
+}
+
+interface ParsedListing {
+  olxId: string;
+  title: string;
+  url: string;
+  price: string;
+  priceNumeric: number;
+  description: string;
+  city: string | null;
+  region: string | null;
+  district: string | null;
+  rayon: string | null;
+  lat: number | null;
+  lon: number | null;
+  image: string | null;
+  rooms: number | null;
+  area: number | null;
+  floor: number | null;
+  totalFloors: number | null;
+  type: string;
+  lastSeenAt: Date;
+  createdAt: Date;
+  priceHistory: any[];
+}
+
+// ─── Хелперы ───────────────────────────────────────────────────────────────
+
+function getParam(item: OlxItem, key: string): string | null {
+  const param = item.params?.find((p) => p.key === key);
+  return param?.value?.key != null ? String(param.value.key) : null;
+}
+
+function getParamLabel(item: OlxItem, key: string): string | null {
+  const param = item.params?.find((p) => p.key === key);
+  return param?.value?.label || null;
+}
+
+function extractPrice(item: OlxItem): { label: string; numeric: number } {
+  const priceParam = item.params?.find((p) => p.key === 'price');
+  const label = priceParam?.value?.label || 'Договорная';
+
+  // Извлекаем число из строки типа "500 000 сум" или "$300"
+  const raw = String(priceParam?.value?.key || '0');
+  const numeric = parseFloat(raw.replace(/[^0-9.]/g, '')) || 0;
+
+  return { label, numeric };
+}
+
+// ─── Маппинг одного объявления ─────────────────────────────────────────────
+
+function mapItem(item: OlxItem, type: 'rent' | 'sale'): ParsedListing {
+  const { label: priceLabel, numeric: priceNumeric } = extractPrice(item);
+
+  const locationDistrict = item.location?.district?.name || null;
+  const rayonLabel = getParamLabel(item, 'district');
+
+  const areaRaw = getParam(item, 'total_area');
+  const area = areaRaw ? parseFloat(areaRaw) : null;
+
+  return {
+    olxId: String(item.id),
+    title: item.title,
+    url: item.url,
+    price: priceLabel,
+    priceNumeric,
+    description: item.description?.replace(/<br ?\/?>/gi, '\n') || '',
+    city: item.location?.city?.name || null,
+    region: item.location?.region?.name || null,
+    district: locationDistrict,
+    rayon: rayonLabel || locationDistrict,
+    lat: item.map?.lat || null,
+    lon: item.map?.lon || null,
+    image: item.photos?.[0]?.link || null,
+    rooms: getParam(item, 'number_of_rooms') ? Number(getParam(item, 'number_of_rooms')) : null,
+    area: Number.isFinite(area) && area! > 0 ? area : null,
+    floor: getParam(item, 'floor') ? Number(getParam(item, 'floor')) : null,
+    totalFloors: getParam(item, 'total_floors') ? Number(getParam(item, 'total_floors')) : null,
+    type,
+    lastSeenAt: new Date(),
+    createdAt: item.created_time ? new Date(item.created_time) : new Date(),
+    priceHistory: [],
+  };
+}
+
+// ─── Один запрос к OLX API ────────────────────────────────────────────────
+
+async function fetchPage(categoryId: number, offset: number, limit: number): Promise<OlxItem[]> {
+  const url = `${OLX_API}?offset=${offset}&limit=${limit}&category_id=${categoryId}`;
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36',
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(20000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OLX API вернул ${response.status}: ${response.statusText}`);
+  }
+
+  const data = await response.json();
+  return data?.data || [];
+}
+
+// ─── Парсинг одной категории ──────────────────────────────────────────────
+
+async function parseCategory(
+  type: 'rent' | 'sale',
+  maxItems = 500,
+): Promise<ParsedListing[]> {
+  const categoryId = CATEGORIES[type];
+  const limit = 40;
+  let offset = 0;
+  const all: ParsedListing[] = [];
+
+  console.log(`📡 [Parser] Парсим категорию: ${type} (category_id=${categoryId})`);
+
+  while (all.length < maxItems) {
+    try {
+      const items = await fetchPage(categoryId, offset, limit);
+
+      if (!items.length) {
+        console.log(`📭 [Parser] Больше нет объявлений (offset=${offset})`);
+        break;
+      }
+
+      const mapped = items.map((item) => mapItem(item, type));
+      all.push(...mapped);
+      offset += limit;
+
+      console.log(`📦 [Parser] Загружено ${all.length} объявлений (${type})`);
+
+      // Небольшая пауза чтобы не спамить API
+      await new Promise((r) => setTimeout(r, 300));
+    } catch (err) {
+      console.error(`❌ [Parser] Ошибка при загрузке страницы (offset=${offset}):`, err);
+      break;
+    }
+  }
+
+  return all.slice(0, maxItems);
+}
+
+// ─── Сохранение в БД (upsert) ─────────────────────────────────────────────
+
+async function saveListings(listings: ParsedListing[]): Promise<{
+  created: number;
+  updated: number;
+  newIds: number[];
+}> {
+  let created = 0;
+  let updated = 0;
+  const newIds: number[] = [];
+
+  for (const listing of listings) {
+    try {
+      // Проверяем существует ли уже
+      const existing = await prisma.listing.findUnique({
+        where: { olxId: listing.olxId },
+        select: { id: true, priceNumeric: true, priceHistory: true },
+      });
+
+      if (existing) {
+        // Обновляем — добавляем в историю цен если цена изменилась
+        const priceHistory = (existing.priceHistory as any[]) || [];
+
+        if (existing.priceNumeric !== listing.priceNumeric) {
+          priceHistory.push({
+            price: existing.priceNumeric,
+            date: new Date().toISOString(),
+          });
+        }
+
+        await prisma.listing.update({
+          where: { olxId: listing.olxId },
+          data: {
+            ...listing,
+            priceHistory,
+            isMatched: false, // сбрасываем — чтобы перепроверить фильтры
+          },
+        });
+        updated++;
+      } else {
+        // Создаём новое
+        const saved = await prisma.listing.create({
+          data: {
+            ...listing,
+            isMatched: false,
+          },
+        });
+        newIds.push(saved.id);
+        created++;
+      }
+    } catch (err) {
+      console.error(`❌ [Parser] Ошибка сохранения olxId=${listing.olxId}:`, err);
+    }
+  }
+
+  return { created, updated, newIds };
+}
+
+// ─── Очистка старых объявлений ────────────────────────────────────────────
+
+async function cleanupOldListings(days = 14): Promise<number> {
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const result = await prisma.listing.deleteMany({
+    where: {
+      lastSeenAt: { lt: cutoff },
+    },
+  });
+
+  return result.count;
+}
+
+// ─── Главная функция ──────────────────────────────────────────────────────
+
+export async function runParser(options?: {
+  maxPerCategory?: number;
+  categories?: ('rent' | 'sale')[];
+  cleanupDays?: number;
+}) {
+  const {
+    maxPerCategory = 500,
+    categories = ['rent', 'sale'],
+    cleanupDays = 14,
+  } = options || {};
+
+  console.log('🚀 [Parser] Запуск парсера OLX...', new Date().toISOString());
+
+  let totalCreated = 0;
+  let totalUpdated = 0;
+  const allNewIds: number[] = [];
+
+  for (const type of categories) {
+    try {
+      const listings = await parseCategory(type, maxPerCategory);
+
+      if (!listings.length) {
+        console.log(`⚠️ [Parser] Нет объявлений для категории: ${type}`);
+        continue;
+      }
+
+      const { created, updated, newIds } = await saveListings(listings);
+      totalCreated += created;
+      totalUpdated += updated;
+      allNewIds.push(...newIds);
+
+      console.log(`✅ [Parser] ${type}: создано=${created} обновлено=${updated}`);
+    } catch (err) {
+      console.error(`❌ [Parser] Ошибка категории ${type}:`, err);
+    }
+  }
+
+  // Очистка старых
+  const deleted = await cleanupOldListings(cleanupDays);
+  if (deleted > 0) {
+    console.log(`🧹 [Parser] Удалено старых объявлений (>${cleanupDays} дней): ${deleted}`);
+  }
+
+  console.log(
+    `🎉 [Parser] Готово! Создано: ${totalCreated}, Обновлено: ${totalUpdated}, Удалено: ${deleted}`,
+  );
+
+  return {
+    created: totalCreated,
+    updated: totalUpdated,
+    deleted,
+    newListingIds: allNewIds,
+  };
+}
