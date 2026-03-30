@@ -13,6 +13,8 @@ declare global {
             language_code?: string;
           };
         };
+        ready: () => void;
+        expand: () => void;
         showAlert: (message: string) => void;
         close: () => void;
       };
