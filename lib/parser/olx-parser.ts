@@ -4,8 +4,8 @@ const OLX_API = 'https://olx.uz/api/v1/offers/';
 
 // Категории OLX (аренда квартир / продажа квартир)
 const CATEGORIES = {
-  rent: 1511,   // Сдам — квартиры
-  sale: 1510,   // Продам — квартиры
+  rent: 1511, // Сдам — квартиры
+  sale: 1510, // Продам — квартиры
 };
 
 // ─── Типы ──────────────────────────────────────────────────────────────────
@@ -70,15 +70,35 @@ function getParamLabel(item: OlxItem, key: string): string | null {
   return param?.value?.label || null;
 }
 
+// Курс сума к доллару — обновляй раз в месяц или подключи API
+const UZS_TO_USD_RATE = 12800;
+
 function extractPrice(item: OlxItem): { label: string; numeric: number } {
   const priceParam = item.params?.find((p) => p.key === 'price');
   const label = priceParam?.value?.label || 'Договорная';
 
-  // Извлекаем число из строки типа "500 000 сум" или "$300"
-  const raw = String(priceParam?.value?.key || '0');
-  const numeric = parseFloat(raw.replace(/[^0-9.]/g, '')) || 0;
+  const rawKey = priceParam?.value?.key;
+  let priceInSums = 0;
 
-  return { label, numeric };
+  if (rawKey !== null && rawKey !== undefined) {
+    const parsed = parseFloat(String(rawKey).replace(/[^0-9.]/g, ''));
+    if (Number.isFinite(parsed) && parsed > 0) {
+      priceInSums = parsed;
+    }
+  }
+
+  // Если value.key пустой — пробуем из label
+  if (priceInSums === 0 && label && label !== 'Договорная') {
+    const fromLabel = parseFloat(label.replace(/[^0-9.]/g, ''));
+    if (Number.isFinite(fromLabel) && fromLabel > 0) {
+      priceInSums = fromLabel;
+    }
+  }
+
+  // Конвертируем в USD (округляем до целого)
+  const priceInUsd = priceInSums > 0 ? Math.round(priceInSums / UZS_TO_USD_RATE) : 0;
+
+  return { label, numeric: priceInUsd };
 }
 
 // ─── Маппинг одного объявления ─────────────────────────────────────────────
@@ -141,10 +161,7 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
 
 // ─── Парсинг одной категории ──────────────────────────────────────────────
 
-async function parseCategory(
-  type: 'rent' | 'sale',
-  maxItems = 500,
-): Promise<ParsedListing[]> {
+async function parseCategory(type: 'rent' | 'sale', maxItems = 500): Promise<ParsedListing[]> {
   const categoryId = CATEGORIES[type];
   const limit = 40;
   let offset = 0;
@@ -257,11 +274,7 @@ export async function runParser(options?: {
   categories?: ('rent' | 'sale')[];
   cleanupDays?: number;
 }) {
-  const {
-    maxPerCategory = 500,
-    categories = ['rent', 'sale'],
-    cleanupDays = 14,
-  } = options || {};
+  const { maxPerCategory = 500, categories = ['rent', 'sale'], cleanupDays = 14 } = options || {};
 
   console.log('🚀 [Parser] Запуск парсера OLX...', new Date().toISOString());
 
