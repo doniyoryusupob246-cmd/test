@@ -245,18 +245,13 @@ function parseCriteria(criteria: any): FilterCriteria {
 }
 
 function matchesFilter(listing: any, criteria: FilterCriteria): boolean {
-  // ─── ФИКС #1: Район ───────────────────────────────────────────────────────
-  // Если пользователь указал район — объявление БЕЗ района не подходит
+  // Район
   if (criteria.district) {
     const filterDistrict = criteria.district.toLowerCase().trim();
     const listingDistrict = (listing.district || '').toLowerCase().trim();
     const listingRayon = (listing.rayon || '').toLowerCase().trim();
 
-    // Если в объявлении вообще нет района — пропускаем
-    if (!listingDistrict && !listingRayon) {
-      console.log(`    ⛔ Район не указан в объявлении — пропускаем`);
-      return false;
-    }
+    if (!listingDistrict && !listingRayon) return false;
 
     const districtMatch =
       listingDistrict.includes(filterDistrict) ||
@@ -264,18 +259,16 @@ function matchesFilter(listing: any, criteria: FilterCriteria): boolean {
       listingRayon.includes(filterDistrict) ||
       filterDistrict.includes(listingRayon);
 
-    if (!districtMatch) {
-      return false;
-    }
+    if (!districtMatch) return false;
   }
 
-  // ─── Цена ─────────────────────────────────────────────────────────────────
+  // Цена
   if (listing.priceNumeric > 0) {
     if (criteria.priceMin && listing.priceNumeric < criteria.priceMin) return false;
     if (criteria.priceMax && listing.priceNumeric > criteria.priceMax) return false;
   }
 
-  // ─── Комнаты ──────────────────────────────────────────────────────────────
+  // Комнаты
   if (criteria.rooms && criteria.rooms.length > 0 && listing.rooms != null) {
     const roomsMatch = criteria.rooms.some((room) => {
       if (room === '5+') return listing.rooms >= 5;
@@ -284,15 +277,15 @@ function matchesFilter(listing: any, criteria: FilterCriteria): boolean {
     if (!roomsMatch) return false;
   }
 
-  // ─── Площадь ──────────────────────────────────────────────────────────────
+  // Площадь
   if (criteria.areaMin && listing.area && listing.area < criteria.areaMin) return false;
   if (criteria.areaMax && listing.area && listing.area > criteria.areaMax) return false;
 
-  // ─── Этаж ─────────────────────────────────────────────────────────────────
+  // Этаж
   if (criteria.floorMin && listing.floor && listing.floor < criteria.floorMin) return false;
   if (criteria.floorMax && listing.floor && listing.floor > criteria.floorMax) return false;
 
-  // ─── Этажность дома ───────────────────────────────────────────────────────
+  // Этажность
   if (
     criteria.totalFloorsMainMin &&
     listing.totalFloors &&
@@ -331,22 +324,25 @@ export async function runMatching() {
       const criteria = parseCriteria(filter.criteria);
       const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-      // ─── ФИКС #2: Дубликаты ─────────────────────────────────────────────
-      // Берём ID объявлений которые УЖЕ отправляли этому пользователю
+      // Загружаем уже отправленные ID — фильтруем null и гарантируем number[]
       const alreadySentNotifications = await prisma.notification.findMany({
         where: { userId: filter.userId },
         select: { listingId: true },
       });
-      const alreadySentIds = new Set(alreadySentNotifications.map((n) => n.listingId));
-      // ────────────────────────────────────────────────────────────────────
+
+      // ✅ ФИКС: фильтруем null, приводим к number[]
+      const alreadySentIds = new Set<number>(
+        alreadySentNotifications.map((n) => n.listingId).filter((id): id is number => id !== null),
+      );
+
+      const excludeIds: number[] = alreadySentIds.size > 0 ? Array.from(alreadySentIds) : [-1]; // -1 чтобы NOT IN не был пустым
 
       const candidates = await prisma.listing.findMany({
         where: {
           type: filter.type,
           createdAt: { gte: sevenDaysAgo },
-          // Исключаем уже отправленные — через NOT IN
           NOT: {
-            id: { in: alreadySentIds.size > 0 ? Array.from(alreadySentIds) : [-1] },
+            id: { in: excludeIds }, // ✅ теперь number[] без null
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -356,7 +352,6 @@ export async function runMatching() {
       console.log(`  📋 Фильтр #${filter.id} "${filter.name}": кандидатов=${candidates.length}`);
 
       for (const listing of candidates) {
-        // Двойная проверка на дубликат (на случай race condition)
         if (alreadySentIds.has(listing.id)) continue;
 
         try {
@@ -378,7 +373,6 @@ export async function runMatching() {
               filter,
             );
 
-            // Записываем СРАЗУ после отправки — предотвращает дубликаты
             await prisma.notification.create({
               data: {
                 userId: filter.userId,
@@ -387,9 +381,7 @@ export async function runMatching() {
               },
             });
 
-            // Добавляем в локальный Set чтобы не отправить дважды в этом же запуске
             alreadySentIds.add(listing.id);
-
             matchedCount++;
           }
         } catch (err) {
