@@ -256,7 +256,9 @@ function parseCriteria(criteria: any): FilterCriteria {
     priceMax: typeof criteria.priceMax === 'number' ? criteria.priceMax : undefined,
     rooms:
       Array.isArray(criteria.rooms) && criteria.rooms.length > 0
-        ? criteria.rooms.map(String)
+        ? criteria.rooms
+            .filter((r: any) => r !== undefined && r !== null && r !== 'undefined')
+            .map(String)
         : undefined,
     areaMin: typeof criteria.areaMin === 'number' ? criteria.areaMin : undefined,
     areaMax: typeof criteria.areaMax === 'number' ? criteria.areaMax : undefined,
@@ -266,22 +268,6 @@ function parseCriteria(criteria: any): FilterCriteria {
       typeof criteria.totalFloorsMainMin === 'number' ? criteria.totalFloorsMainMin : undefined,
     totalFloorsMainMax:
       typeof criteria.totalFloorsMainMax === 'number' ? criteria.totalFloorsMainMax : undefined,
-    planning:
-      Array.isArray(criteria.planning) && criteria.planning.length > 0
-        ? criteria.planning.map(String)
-        : undefined,
-    renovation:
-      Array.isArray(criteria.renovation) && criteria.renovation.length > 0
-        ? criteria.renovation.map(String)
-        : undefined,
-    bathroom:
-      Array.isArray(criteria.bathroom) && criteria.bathroom.length > 0
-        ? criteria.bathroom.map(String)
-        : undefined,
-    furniture:
-      Array.isArray(criteria.furniture) && criteria.furniture.length > 0
-        ? criteria.furniture.map(String)
-        : undefined,
   };
 }
 
@@ -289,30 +275,6 @@ function matchesFilter(
   listing: any,
   criteria: FilterCriteria,
 ): { match: boolean; reason?: string } {
-  // Район
-  if (criteria.district) {
-    const filterDistrict = criteria.district.toLowerCase().trim();
-    const listingDistrict = (listing.district || '').toLowerCase().trim();
-    const listingRayon = (listing.rayon || '').toLowerCase().trim();
-
-    if (!listingDistrict && !listingRayon) {
-      return { match: false, reason: `район пустой в объявлении` };
-    }
-
-    const districtMatch =
-      listingDistrict.includes(filterDistrict) ||
-      filterDistrict.includes(listingDistrict) ||
-      listingRayon.includes(filterDistrict) ||
-      filterDistrict.includes(listingRayon);
-
-    if (!districtMatch) {
-      return {
-        match: false,
-        reason: `район: фильтр="${criteria.district}" объявление="${listing.district}/${listing.rayon}"`,
-      };
-    }
-  }
-
   // Цена
   if (listing.priceNumeric > 0) {
     if (criteria.priceMin && listing.priceNumeric < criteria.priceMin) {
@@ -322,12 +284,8 @@ function matchesFilter(
       return { match: false, reason: `цена выше: ${listing.priceNumeric} > ${criteria.priceMax}` };
     }
   } else {
-    // priceNumeric = 0 — цена не распарсилась
     if (criteria.priceMin || criteria.priceMax) {
-      return {
-        match: false,
-        reason: `priceNumeric=0 (цена не распарсилась), label="${listing.price}"`,
-      };
+      return { match: false, reason: `priceNumeric=0` };
     }
   }
 
@@ -346,42 +304,30 @@ function matchesFilter(
   }
 
   // Площадь
-  if (criteria.areaMin && listing.area && listing.area < criteria.areaMin) {
+  if (criteria.areaMin && listing.area && listing.area < criteria.areaMin)
     return { match: false, reason: `площадь мала: ${listing.area} < ${criteria.areaMin}` };
-  }
-  if (criteria.areaMax && listing.area && listing.area > criteria.areaMax) {
+  if (criteria.areaMax && listing.area && listing.area > criteria.areaMax)
     return { match: false, reason: `площадь велика: ${listing.area} > ${criteria.areaMax}` };
-  }
 
   // Этаж
-  if (criteria.floorMin && listing.floor && listing.floor < criteria.floorMin) {
+  if (criteria.floorMin && listing.floor && listing.floor < criteria.floorMin)
     return { match: false, reason: `этаж низкий: ${listing.floor} < ${criteria.floorMin}` };
-  }
-  if (criteria.floorMax && listing.floor && listing.floor > criteria.floorMax) {
+  if (criteria.floorMax && listing.floor && listing.floor > criteria.floorMax)
     return { match: false, reason: `этаж высокий: ${listing.floor} > ${criteria.floorMax}` };
-  }
 
   // Этажность
   if (
     criteria.totalFloorsMainMin &&
     listing.totalFloors &&
     listing.totalFloors < criteria.totalFloorsMainMin
-  ) {
-    return {
-      match: false,
-      reason: `этажность мала: ${listing.totalFloors} < ${criteria.totalFloorsMainMin}`,
-    };
-  }
+  )
+    return { match: false, reason: `этажность мала` };
   if (
     criteria.totalFloorsMainMax &&
     listing.totalFloors &&
     listing.totalFloors > criteria.totalFloorsMainMax
-  ) {
-    return {
-      match: false,
-      reason: `этажность велика: ${listing.totalFloors} > ${criteria.totalFloorsMainMax}`,
-    };
-  }
+  )
+    return { match: false, reason: `этажность велика` };
 
   return { match: true };
 }
@@ -408,7 +354,6 @@ export async function runMatching() {
       const criteria = parseCriteria(filter.criteria);
       const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-      // ── Диагностика фильтра ──────────────────────────────────────────────
       console.log(`\n📋 Фильтр #${filter.id} "${filter.name}"`);
       console.log(
         `   type=${filter.type} district="${criteria.district}" price=${criteria.priceMin}-${criteria.priceMax} rooms=[${criteria.rooms}]`,
@@ -425,31 +370,31 @@ export async function runMatching() {
 
       const excludeIds: number[] = alreadySentIds.size > 0 ? Array.from(alreadySentIds) : [-1];
 
+      // ✅ ГЛАВНЫЙ ФИКС: фильтруем по району прямо в Prisma
+      const districtFilter = criteria.district
+        ? {
+            OR: [
+              { district: { contains: criteria.district, mode: 'insensitive' as const } },
+              { rayon: { contains: criteria.district, mode: 'insensitive' as const } },
+            ],
+          }
+        : {};
+
       const candidates = await prisma.listing.findMany({
         where: {
           type: filter.type,
           createdAt: { gte: sevenDaysAgo },
           NOT: { id: { in: excludeIds } },
+          ...districtFilter, // ← район фильтруется в БД
         },
         orderBy: { createdAt: 'desc' },
         take: 200,
       });
 
-      console.log(`   кандидатов=${candidates.length}, уже отправлено=${alreadySentIds.size}`);
+      console.log(
+        `   кандидатов=${candidates.length} (с районом "${criteria.district}"), уже отправлено=${alreadySentIds.size}`,
+      );
 
-      // ── Диагностика первых 5 кандидатов ─────────────────────────────────
-      if (candidates.length > 0) {
-        console.log(`   Примеры кандидатов:`);
-        candidates.slice(0, 5).forEach((c, i) => {
-          console.log(
-            `   [${i + 1}] district="${c.district}" rayon="${c.rayon}" price=${
-              c.priceNumeric
-            } rooms=${c.rooms}`,
-          );
-        });
-      }
-
-      // Считаем причины отсева
       const rejectReasons: Record<string, number> = {};
       let filterMatchCount = 0;
 
@@ -487,9 +432,7 @@ export async function runMatching() {
             alreadySentIds.add(listing.id);
             matchedCount++;
           } else {
-            // Считаем причины отсева
-            const reason = result.reason || 'неизвестно';
-            const key = reason.split(':')[0]; // берём только тип причины
+            const key = (result.reason || 'неизвестно').split(':')[0];
             rejectReasons[key] = (rejectReasons[key] || 0) + 1;
           }
         } catch (err) {
@@ -497,7 +440,6 @@ export async function runMatching() {
         }
       }
 
-      // ── Итог по фильтру ──────────────────────────────────────────────────
       console.log(`   Совпало: ${filterMatchCount}`);
       if (Object.keys(rejectReasons).length > 0) {
         console.log(`   Причины отсева:`, JSON.stringify(rejectReasons));
