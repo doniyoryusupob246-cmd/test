@@ -34,3 +34,11 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## Изменения по OLX-парсеру
+
+Исправлена логика цены для объявлений OLX. Раньше бот искал цену в старом поле `value.key`, а OLX сейчас часто отдаёт долларовую цену в `value.value` с валютой `UYE`/`USD`. Из-за этого объявления на границе фильтра, например `$400`, могли считаться как `$376` и не попадать в рассылку.
+
+Исправлена логика подбора объявлений. Раньше matcher смотрел на дату первого создания объявления `createdAt` и отбрасывал объявления старше 7 дней, даже если они были видны на OLX. Теперь matcher не ограничивает объявления по свежести: он берёт все подходящие объявления, которые есть в базе и ещё не отправлялись пользователю.
+
+Фильтр без комиссии оставлен как есть: объявления с `comission = yes` по-прежнему не сохраняются и не отправляются.

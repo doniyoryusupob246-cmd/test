@@ -239,7 +239,15 @@ interface FilterCriteria {
   furniture?: string[];
 }
 
-function parseCriteria(criteria: any): FilterCriteria {
+interface ListingForMatch {
+  priceNumeric: number;
+  rooms: number | null;
+  area: number | null;
+  floor: number | null;
+  totalFloors: number | null;
+}
+
+function parseCriteria(criteria: unknown): FilterCriteria {
   if (typeof criteria === 'string') {
     try {
       criteria = JSON.parse(criteria);
@@ -249,30 +257,32 @@ function parseCriteria(criteria: any): FilterCriteria {
   }
   if (!criteria || typeof criteria !== 'object') return { type: 'rent' };
 
+  const data = criteria as Record<string, unknown>;
+
   return {
-    type: criteria.type === 'sale' ? 'sale' : 'rent',
-    district: criteria.district || undefined,
-    priceMin: typeof criteria.priceMin === 'number' ? criteria.priceMin : undefined,
-    priceMax: typeof criteria.priceMax === 'number' ? criteria.priceMax : undefined,
+    type: data.type === 'sale' ? 'sale' : 'rent',
+    district: typeof data.district === 'string' && data.district ? data.district : undefined,
+    priceMin: typeof data.priceMin === 'number' ? data.priceMin : undefined,
+    priceMax: typeof data.priceMax === 'number' ? data.priceMax : undefined,
     rooms:
-      Array.isArray(criteria.rooms) && criteria.rooms.length > 0
-        ? criteria.rooms
-            .filter((r: any) => r !== undefined && r !== null && r !== 'undefined')
+      Array.isArray(data.rooms) && data.rooms.length > 0
+        ? data.rooms
+            .filter((r: unknown) => r !== undefined && r !== null && r !== 'undefined')
             .map(String)
         : undefined,
-    areaMin: typeof criteria.areaMin === 'number' ? criteria.areaMin : undefined,
-    areaMax: typeof criteria.areaMax === 'number' ? criteria.areaMax : undefined,
-    floorMin: typeof criteria.floorMin === 'number' ? criteria.floorMin : undefined,
-    floorMax: typeof criteria.floorMax === 'number' ? criteria.floorMax : undefined,
+    areaMin: typeof data.areaMin === 'number' ? data.areaMin : undefined,
+    areaMax: typeof data.areaMax === 'number' ? data.areaMax : undefined,
+    floorMin: typeof data.floorMin === 'number' ? data.floorMin : undefined,
+    floorMax: typeof data.floorMax === 'number' ? data.floorMax : undefined,
     totalFloorsMainMin:
-      typeof criteria.totalFloorsMainMin === 'number' ? criteria.totalFloorsMainMin : undefined,
+      typeof data.totalFloorsMainMin === 'number' ? data.totalFloorsMainMin : undefined,
     totalFloorsMainMax:
-      typeof criteria.totalFloorsMainMax === 'number' ? criteria.totalFloorsMainMax : undefined,
+      typeof data.totalFloorsMainMax === 'number' ? data.totalFloorsMainMax : undefined,
   };
 }
 
 function matchesFilter(
-  listing: any,
+  listing: ListingForMatch,
   criteria: FilterCriteria,
 ): { match: boolean; reason?: string } {
   // Цена
@@ -291,9 +301,10 @@ function matchesFilter(
 
   // Комнаты
   if (criteria.rooms && criteria.rooms.length > 0 && listing.rooms != null) {
+    const listingRooms = listing.rooms;
     const roomsMatch = criteria.rooms.some((room: string) => {
-      if (room === '5+') return listing.rooms >= 5;
-      return listing.rooms === parseInt(room);
+      if (room === '5+') return listingRooms >= 5;
+      return listingRooms === parseInt(room);
     });
     if (!roomsMatch) {
       return {
@@ -352,7 +363,6 @@ export async function runMatching() {
 
     for (const filter of filters) {
       const criteria = parseCriteria(filter.criteria);
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
       console.log(`\n📋 Фильтр #${filter.id} "${filter.name}"`);
       console.log(
@@ -383,7 +393,6 @@ export async function runMatching() {
       const candidates = await prisma.listing.findMany({
         where: {
           type: filter.type,
-          createdAt: { gte: sevenDaysAgo },
           NOT: { id: { in: excludeIds } },
           ...districtFilter, // ← район фильтруется в БД
         },

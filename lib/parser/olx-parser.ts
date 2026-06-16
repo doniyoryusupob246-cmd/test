@@ -582,6 +582,7 @@
 
 
 import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 
 const OLX_API = 'https://olx.uz/api/v1/offers/';
 
@@ -596,7 +597,14 @@ const CITY_ID = 4;   // Ташкент
 
 interface OlxParam {
   key: string;
-  value?: { key?: string | number; label?: string };
+  value?: {
+    key?: string | number;
+    label?: string;
+    value?: string | number;
+    currency?: string;
+    converted_value?: string | number;
+    converted_currency?: string;
+  };
 }
 
 interface OlxItem {
@@ -614,6 +622,7 @@ interface OlxItem {
   map?: { lat?: number; lon?: number };
   photos?: { link?: string }[];
   created_time?: string;
+  last_refresh_time?: string;
 }
 
 interface ParsedListing {
@@ -637,7 +646,12 @@ interface ParsedListing {
   type: string;
   lastSeenAt: Date;
   createdAt: Date;
-  priceHistory: any[];
+  priceHistory: PriceHistoryEntry[];
+}
+
+interface PriceHistoryEntry extends Prisma.InputJsonObject {
+  price: number;
+  date: string;
 }
 
 function getParam(item: OlxItem, key: string): string | null {
@@ -655,7 +669,23 @@ const UZS_TO_USD_RATE = Number(process.env.UZS_TO_USD_RATE) || 12800;
 function extractPrice(item: OlxItem): { label: string; numeric: number } {
   const priceParam = item.params?.find((p) => p.key === 'price');
   const label = priceParam?.value?.label || 'Договорная';
-  const rawKey = priceParam?.value?.key;
+  const value = priceParam?.value;
+
+  if (value?.currency === 'UYE' || value?.currency === 'USD') {
+    const parsed = Number(value.value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { label, numeric: Math.round(parsed) };
+    }
+  }
+
+  if (value?.converted_currency === 'UYE' || value?.converted_currency === 'USD') {
+    const parsed = Number(value.converted_value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { label, numeric: Math.round(parsed) };
+    }
+  }
+
+  const rawKey = value?.key ?? value?.value;
   let priceInSums = 0;
 
   if (rawKey !== null && rawKey !== undefined) {
@@ -701,7 +731,7 @@ function mapItem(item: OlxItem, type: 'rent' | 'sale'): ParsedListing | null {
     floor: getParam(item, 'floor') ? Number(getParam(item, 'floor')) : null,
     totalFloors: getParam(item, 'total_floors') ? Number(getParam(item, 'total_floors')) : null,
     type,
-    lastSeenAt: new Date(),
+    lastSeenAt: item.last_refresh_time ? new Date(item.last_refresh_time) : new Date(),
     createdAt: item.created_time ? new Date(item.created_time) : new Date(),
     priceHistory: [],
   };
@@ -767,7 +797,7 @@ async function saveListings(listings: ParsedListing[]): Promise<{ created: numbe
       });
 
       if (existing) {
-        const priceHistory = (existing.priceHistory as any[]) || [];
+        const priceHistory = (existing.priceHistory as unknown as PriceHistoryEntry[]) || [];
         if (existing.priceNumeric !== listing.priceNumeric) {
           priceHistory.push({ price: existing.priceNumeric, date: new Date().toISOString() });
         }
