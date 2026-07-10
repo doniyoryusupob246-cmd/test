@@ -1,44 +1,117 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MyPropertyBot
 
-## Getting Started
+Telegram Mini App и backend-сервис для поиска квартир на OLX. Пользователь создает фильтр в мини-приложении, а бот регулярно парсит объявления, сопоставляет их с активными фильтрами и отправляет подходящие варианты в Telegram.
 
-First, run the development server:
+Проект показывает полный цикл: Telegram Bot API, Mini App UI, парсинг внешнего источника, хранение данных в PostgreSQL, фильтрацию объявлений, cron-автоматизацию и отправку уведомлений.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Что умеет проект
+
+- Авторизация пользователя через Telegram и сохранение `telegramId` / `chatId`.
+- Создание, редактирование, включение и удаление фильтров поиска.
+- Фильтры по типу сделки, району, цене, комнатам, площади, этажу и этажности.
+- Парсинг OLX по категориям аренды и продажи квартир в Ташкенте.
+- Отбор объявлений без комиссии.
+- Нормализация цены в долларах, включая актуальный формат цены OLX.
+- Сохранение объявлений в PostgreSQL через Prisma.
+- История изменения цены объявления.
+- Защита от повторной отправки одного объявления одному пользователю.
+- Telegram-уведомления с фото, ценой, районом, характеристиками и ссылкой на объявление.
+- Cron endpoint для автоматического цикла `parse + match`.
+
+## Стек
+
+- Next.js 16 App Router
+- React 19
+- TypeScript
+- Prisma 7
+- PostgreSQL
+- Telegram Bot API (`node-telegram-bot-api`)
+- Telegram Web App
+- Tailwind CSS / shadcn / Radix UI
+- OLX public API
+
+## Архитектура
+
+```text
+Telegram user
+    |
+    | /start
+    v
+Telegram Bot API -> /api/bot
+    |
+    v
+Telegram Mini App -> фильтры пользователя -> /api/filter
+    |
+    v
+PostgreSQL
+
+External cron -> /api/cron
+    |
+    | 1. runParser()
+    v
+OLX API -> Listing upsert
+    |
+    | 2. runMatching()
+    v
+Active filters -> Telegram notifications
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Основная логика разделена по слоям:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `lib/parser/olx-parser.ts` - загрузка, нормализация и сохранение объявлений OLX.
+- `lib/matcher/matcher.ts` - проверка объявлений по пользовательским фильтрам.
+- `lib/matcher/notification.ts` - форматирование и отправка Telegram-уведомлений.
+- `app/api/cron/route.ts` - полный cron-цикл: парсер + matcher.
+- `app/api/filter/*` - CRUD для фильтров пользователя.
+- `prisma/schema.prisma` - модели пользователей, фильтров, объявлений и уведомлений.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Модель данных
 
-## Learn More
+Ключевые сущности:
 
-To learn more about Next.js, take a look at the following resources:
+- `User` - Telegram-пользователь и его `chatId`.
+- `Filter` - сохраненный пользовательский фильтр в JSON-формате.
+- `Listing` - объявление OLX с ценой, районом, комнатами, площадью, этажами и историей цены.
+- `Notification` - факт отправки объявления пользователю. Уникальность `userId + listingId` защищает от дублей.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## API
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Endpoint                         | Назначение                                      |
+| -------------------------------- | ----------------------------------------------- |
+| `POST /api/bot`                  | Telegram webhook для команды `/start`           |
+| `POST /api/filter`               | Создание фильтра                                |
+| `GET /api/filter?telegramId=...` | Получение активных фильтров пользователя        |
+| `GET /api/filter/[id]`           | Получение одного фильтра                        |
+| `PUT /api/filter/[id]`           | Обновление фильтра                              |
+| `DELETE /api/filter/[id]`        | Удаление фильтра                                |
+| `POST /api/cron`                 | Полный цикл: парсинг OLX и отправка уведомлений |
+| `POST /api/cron/parse`           | Только парсинг OLX                              |
+| `POST /api/matcher`              | Только matching и отправка уведомлений          |
 
-## Deploy on Vercel
+## Cron
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+В serverless-окружении `node-cron` не используется как постоянный процесс. Вместо этого внешний cron-сервис вызывает endpoint:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+curl -X POST https://your-domain.com/api/cron \
+  -H "Authorization: Bearer YOUR_CRON_SECRET"
+```
 
-## Изменения по OLX-парсеру
+Подробные варианты настройки описаны в `docs/CRON_SETUP.md`.
 
-Исправлена логика цены для объявлений OLX. Раньше бот искал цену в старом поле `value.key`, а OLX сейчас часто отдаёт долларовую цену в `value.value` с валютой `UYE`/`USD`. Из-за этого объявления на границе фильтра, например `$400`, могли считаться как `$376` и не попадать в рассылку.
+## Особенности реализации
 
-Исправлена логика подбора объявлений. Раньше matcher смотрел на дату первого создания объявления `createdAt` и отбрасывал объявления старше 7 дней, даже если они были видны на OLX. Теперь matcher не ограничивает объявления по свежести: он берёт все подходящие объявления, которые есть в базе и ещё не отправлялись пользователю.
+- Парсер использует `upsert`-подход: новые объявления создаются, существующие обновляются.
+- Цена хранится в двух видах: оригинальная строка для отображения и `priceNumeric` для фильтрации.
+- OLX может отдавать цену в разных форматах, поэтому парсер учитывает `value`, `currency`, `converted_value` и fallback через `label`.
+- Matcher не ограничивает объявления по свежести: он берет подходящие объявления из базы, если они еще не отправлялись пользователю.
+- Объявления с комиссией отсекаются на этапе парсинга.
+- Для Telegram Mini App UI используется компонентный подход: отдельные компоненты для цены, района, комнат, площади, этажей и дополнительных параметров.
 
-Фильтр без комиссии оставлен как есть: объявления с `comission = yes` по-прежнему не сохраняются и не отправляются.
+## Что демонстрирует проект работодателю
+
+- Интеграцию с Telegram Bot API и Telegram Mini Apps.
+- Работу с внешним API и нестабильными форматами данных.
+- Проектирование схемы данных и связей через Prisma.
+- Реализацию фонового pipeline: парсинг, нормализация, matching, уведомления.
+- Практическую работу с бизнес-логикой фильтрации и защитой от дублей.
