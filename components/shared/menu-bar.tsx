@@ -12,8 +12,8 @@ export const MenuBar: React.FC<Props> = ({ className }) => {
   const [isActive, setIsActive] = React.useState(0);
   const pathname = usePathname();
   const links = [
-    { text: 'Создать фильтр', link: '/' },
-    { text: 'Мои фильтры', link: '/myFilters' },
+    { text: 'Создать фильтр', link: '/new-filter' },
+    { text: 'Мои фильтры', link: '/' },
   ];
 
   return (

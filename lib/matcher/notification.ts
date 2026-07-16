@@ -34,21 +34,39 @@ interface Filter {
 }
 
 /**
- * Форматирует сообщение для отправки
+ * Экранирует спецсимволы HTML, чтобы parse_mode: 'HTML' не падал
+ * на пользовательском тексте (заголовки/описания OLX).
+ */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * OLX отдаёт ссылку на фото с плейсхолдером `{width}x{height}`.
+ * Telegram не может скачать такой URL — подставляем реальные размеры.
+ */
+function resolveImageUrl(image?: string | null): string | null {
+  if (!image) return null;
+  return image.replace('{width}x{height}', '1000x700');
+}
+
+/**
+ * Форматирует сообщение для отправки (parse_mode: HTML).
+ * HTML устойчивее legacy Markdown: не ломается на _ * [ ] ( ).
  */
 function formatMessage(listing: Listing, filterName?: string | null): string {
-  let message = '🏠 *Новая квартира по вашему фильтру!*\n\n';
+  let message = '🏠 <b>Новая квартира по вашему фильтру!</b>\n\n';
 
   if (filterName) {
-    message += `📌 *Фильтр:* ${filterName}\n\n`;
+    message += `📌 <b>Фильтр:</b> ${escapeHtml(filterName)}\n\n`;
   }
 
-  message += `*${listing.title}*\n\n`;
+  message += `<b>${escapeHtml(listing.title)}</b>\n\n`;
 
   // Район
   const district = listing.district || listing.rayon || 'Не указан';
-  message += `📍 *Район:* ${district}\n`;
-  message += `💰 *Цена:* ${listing.price}\n`;
+  message += `📍 <b>Район:</b> ${escapeHtml(district)}\n`;
+  message += `💰 <b>Цена:</b> ${escapeHtml(listing.price)}\n`;
 
   // Детали
   const details = [];
@@ -59,49 +77,67 @@ function formatMessage(listing: Listing, filterName?: string | null): string {
   }
 
   if (details.length) {
-    message += `📐 *Характеристики:* ${details.join(', ')}\n`;
+    message += `📐 <b>Характеристики:</b> ${escapeHtml(details.join(', '))}\n`;
   }
 
   // Описание (первые 150 символов)
   if (listing.description) {
     const shortDesc = listing.description.substring(0, 150);
-    message += `\n📝 *Описание:* ${shortDesc}...\n`;
+    message += `\n📝 <b>Описание:</b> ${escapeHtml(shortDesc)}...\n`;
   }
 
-  message += `\n🔗 [Открыть объявление](${listing.url})`;
+  message += `\n🔗 <a href="${escapeHtml(listing.url)}">Открыть объявление</a>`;
 
   return message;
 }
 
 /**
- * Отправляет уведомление пользователю
+ * Отправляет уведомление пользователю.
+ * Возвращает true только при успешной доставке — matcher помечает
+ * объявление как отправленное лишь по факту успеха, иначе повторит
+ * в следующем цикле (а не потеряет навсегда).
  */
-export async function sendNotification(user: User, listing: Listing, filter?: Filter) {
-  try {
-    // Проверяем наличие chatId
-    if (!user.chatId) {
-      console.error(`❌ Нет chatId для пользователя ${user.telegramId}`);
-      return;
-    }
+export async function sendNotification(
+  user: User,
+  listing: Listing,
+  filter?: Filter,
+): Promise<boolean> {
+  // Проверяем наличие chatId
+  if (!user.chatId) {
+    console.error(`❌ Нет chatId для пользователя ${user.telegramId}`);
+    return false;
+  }
 
-    const message = formatMessage(listing, filter?.name);
+  const message = formatMessage(listing, filter?.name);
+  const image = resolveImageUrl(listing.image);
 
-    // Если есть фото, отправляем с фото
-    if (listing.image) {
-      await bot.sendPhoto(user.chatId, listing.image, {
+  // Попытка 1: с фото
+  if (image) {
+    try {
+      await bot.sendPhoto(user.chatId, image, {
         caption: message,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
       });
-    } else {
-      await bot.sendMessage(user.chatId, message, {
-        parse_mode: 'Markdown',
-        disable_web_page_preview: false,
-      });
+      console.log(`📨 Уведомление (с фото) отправлено пользователю ${user.chatId}`);
+      return true;
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      console.warn(`⚠️ sendPhoto упал (${msg}) — пробуем без фото`);
+      // не выходим: фолбэк на текст ниже
     }
+  }
 
-    console.log(`📨 Уведомление отправлено пользователю ${user.chatId}`);
+  // Попытка 2 (фолбэк): текстовое сообщение без фото
+  try {
+    await bot.sendMessage(user.chatId, message, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: false,
+    });
+    console.log(`📨 Уведомление (текст) отправлено пользователю ${user.chatId}`);
+    return true;
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Неизвестная ошибка';
-    console.error(`❌ Ошибка отправки уведомления пользователю ${user.chatId}:`, errorMessage);
+    const msg = error instanceof Error ? error.message : 'Неизвестная ошибка';
+    console.error(`❌ Ошибка отправки уведомления пользователю ${user.chatId}:`, msg);
+    return false;
   }
 }

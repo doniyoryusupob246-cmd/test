@@ -58,11 +58,11 @@ export async function POST(request: Request) {
             [
               {
                 text: '🔍 Создать фильтр',
-                web_app: { url: `${process.env.APP_URL}/` },
+                web_app: { url: `${process.env.APP_URL}/new-filter` },
               },
               {
                 text: '📋 Мои фильтры',
-                web_app: { url: `${process.env.APP_URL}/filters` },
+                web_app: { url: `${process.env.APP_URL}/` },
               },
             ],
           ],
