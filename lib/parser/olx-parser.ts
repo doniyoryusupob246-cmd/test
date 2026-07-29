@@ -60,6 +60,10 @@ interface ParsedListing {
   area: number | null;
   floor: number | null;
   totalFloors: number | null;
+  layout: string | null;
+  repairs: string | null;
+  wc: string | null;
+  furnished: boolean | null;
   type: string;
   lastSeenAt: Date;
   createdAt: Date;
@@ -128,6 +132,8 @@ function mapItem(item: OlxItem, type: 'rent' | 'sale'): ParsedListing | null {
   const rayonLabel = getParamLabel(item, 'district');
   const areaRaw = getParam(item, 'total_area');
   const area = areaRaw ? parseFloat(areaRaw) : null;
+  // OLX отдаёт мебель как yes/no; у части объявлений параметра нет вовсе.
+  const furnishedRaw = getParam(item, 'furnished');
 
   return {
     olxId: String(item.id),
@@ -151,6 +157,10 @@ function mapItem(item: OlxItem, type: 'rent' | 'sale'): ParsedListing | null {
     area: Number.isFinite(area) && area! > 0 ? area : null,
     floor: getParam(item, 'floor') ? Number(getParam(item, 'floor')) : null,
     totalFloors: getParam(item, 'total_floors') ? Number(getParam(item, 'total_floors')) : null,
+    layout: getParamLabel(item, 'layout'),
+    repairs: getParamLabel(item, 'repairs'),
+    wc: getParamLabel(item, 'wc'),
+    furnished: furnishedRaw === 'yes' ? true : furnishedRaw === 'no' ? false : null,
     type,
     lastSeenAt: item.last_refresh_time ? new Date(item.last_refresh_time) : new Date(),
     createdAt: item.created_time ? new Date(item.created_time) : new Date(),

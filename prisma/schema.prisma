@@ -60,6 +60,14 @@ model Listing {
   totalFloors  Int?
   type         String? // 'rent' или 'sale'
 
+  // Дополнительные параметры. Храним метку OLX как есть
+  // ("Раздельная", "Евроремонт", "2 санузла и более") — сопоставление
+  // с вариантами из UI живёт в matcher.
+  layout    String? // Планировка
+  repairs   String? // Ремонт
+  wc        String? // Санузел
+  furnished Boolean? // Мебель
+
   // Новое поле для матчинга
   isMatched Boolean @default(false)
 

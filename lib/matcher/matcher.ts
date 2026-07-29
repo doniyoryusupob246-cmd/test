@@ -25,9 +25,67 @@ interface ListingForMatch {
   area: number | null;
   floor: number | null;
   totalFloors: number | null;
+  layout: string | null;
+  repairs: string | null;
+  wc: string | null;
+  furnished: boolean | null;
 }
 
-function parseCriteria(criteria: unknown): FilterCriteria {
+/**
+ * OLX и наш UI называют одни и те же значения по-разному: «Совмещённый» против
+ * «Совмещенный», «Черновая» против «Черновая отделка». Приводим обе стороны к
+ * одному виду, чтобы сравнивать по смыслу, а не побуквенно.
+ */
+function normalizeLabel(value: string): string {
+  return value.toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+// Вариант из UI -> как то же самое называется в OLX.
+const LABEL_ALIASES: Record<string, string> = {
+  '2+': '2 санузла и более',
+  черновая: 'черновая отделка',
+  предчистовая: 'предчистовая отделка',
+};
+
+function canonical(value: string): string {
+  const normalized = normalizeLabel(value);
+  return LABEL_ALIASES[normalized] ?? normalized;
+}
+
+/**
+ * Сравнивает выбранные в фильтре варианты со значением объявления.
+ * У части объявлений параметр не заполнен — такие не отсеиваем, как и в
+ * проверках площади и этажа ниже: лучше показать лишнее, чем молча потерять.
+ */
+function matchesLabel(selected: string[] | undefined, listingValue: string | null): boolean {
+  if (!selected || selected.length === 0) return true;
+  if (!listingValue) return true;
+
+  const target = canonical(listingValue);
+  return selected.some((option) => canonical(option) === target);
+}
+
+function matchesFurniture(selected: string[] | undefined, listingValue: boolean | null): boolean {
+  if (!selected || selected.length === 0) return true;
+
+  // «Все» означает «без разницы» — если выбран только он, фильтр не ограничивает.
+  const wanted = selected.map(canonical).filter((option) => option !== 'все');
+  if (wanted.length === 0) return true;
+  if (listingValue === null) return true;
+
+  return wanted.some((option) => (option === 'да') === listingValue);
+}
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const items = value.filter(
+    (item): item is string => typeof item === 'string' && item !== '' && item !== 'undefined',
+  );
+  return items.length > 0 ? items : undefined;
+}
+
+export function parseCriteria(criteria: unknown): FilterCriteria {
   if (typeof criteria === 'string') {
     try {
       criteria = JSON.parse(criteria);
@@ -58,10 +116,14 @@ function parseCriteria(criteria: unknown): FilterCriteria {
       typeof data.totalFloorsMainMin === 'number' ? data.totalFloorsMainMin : undefined,
     totalFloorsMainMax:
       typeof data.totalFloorsMainMax === 'number' ? data.totalFloorsMainMax : undefined,
+    planning: parseStringArray(data.planning),
+    renovation: parseStringArray(data.renovation),
+    bathroom: parseStringArray(data.bathroom),
+    furniture: parseStringArray(data.furniture),
   };
 }
 
-function matchesFilter(
+export function matchesFilter(
   listing: ListingForMatch,
   criteria: FilterCriteria,
 ): { match: boolean; reason?: string } {
@@ -120,6 +182,28 @@ function matchesFilter(
   )
     return { match: false, reason: `этажность велика` };
 
+  // Дополнительные параметры
+  if (!matchesLabel(criteria.planning, listing.layout))
+    return {
+      match: false,
+      reason: `планировка: фильтр=[${criteria.planning}] объявление=${listing.layout}`,
+    };
+  if (!matchesLabel(criteria.renovation, listing.repairs))
+    return {
+      match: false,
+      reason: `ремонт: фильтр=[${criteria.renovation}] объявление=${listing.repairs}`,
+    };
+  if (!matchesLabel(criteria.bathroom, listing.wc))
+    return {
+      match: false,
+      reason: `санузел: фильтр=[${criteria.bathroom}] объявление=${listing.wc}`,
+    };
+  if (!matchesFurniture(criteria.furniture, listing.furnished))
+    return {
+      match: false,
+      reason: `мебель: фильтр=[${criteria.furniture}] объявление=${listing.furnished}`,
+    };
+
   return { match: true };
 }
 
@@ -147,6 +231,9 @@ export async function runMatching() {
       console.log(`\n📋 Фильтр #${filter.id} "${filter.name}"`);
       console.log(
         `   type=${filter.type} district="${criteria.district}" price=${criteria.priceMin}-${criteria.priceMax} rooms=[${criteria.rooms}]`,
+      );
+      console.log(
+        `   планировка=[${criteria.planning ?? ''}] ремонт=[${criteria.renovation ?? ''}] санузел=[${criteria.bathroom ?? ''}] мебель=[${criteria.furniture ?? ''}]`,
       );
 
       const alreadySentNotifications = await prisma.notification.findMany({
