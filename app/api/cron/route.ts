@@ -1,3 +1,6 @@
+// cron-job.org ждёт ответ не дольше 30 с — держим цикл в этом бюджете.
+export const maxDuration = 60;
+
 import { NextRequest, NextResponse } from 'next/server';
 import { runParser } from '@/lib/parser/olx-parser';
 import { runMatching } from '@/lib/matcher/matcher';

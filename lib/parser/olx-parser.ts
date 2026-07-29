@@ -186,64 +186,112 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
   return data?.data || [];
 }
 
+/** Сколько страниц OLX тянем одновременно. Последовательно 13 страниц с паузами
+ *  занимали больше половины бюджета крона (30 с у cron-job.org). */
+const PAGE_CONCURRENCY = 5;
+
 async function parseCategory(type: 'rent' | 'sale', maxItems = 500): Promise<ParsedListing[]> {
   const categoryId = CATEGORIES[type];
   const limit = 40;
-  let offset = 0;
+  const offsets = Array.from({ length: Math.ceil(maxItems / limit) }, (_, i) => i * limit);
   const all: ParsedListing[] = [];
 
   console.log(`📡 [Parser] Парсим: ${type} (category_id=${categoryId})`);
 
-  while (all.length < maxItems) {
-    try {
-      const items = await fetchPage(categoryId, offset, limit);
-      if (!items.length) { console.log(`📭 Нет объявлений (offset=${offset})`); break; }
+  for (let i = 0; i < offsets.length; i += PAGE_CONCURRENCY) {
+    const batch = offsets.slice(i, i + PAGE_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map((o) => fetchPage(categoryId, o, limit)));
 
-      const mapped = items
-        .map((item) => mapItem(item, type))
-        .filter((item): item is ParsedListing => item !== null);
-
-      all.push(...mapped);
-      offset += limit;
-      console.log(`📦 [Parser] Загружено ${all.length} (${type})`);
-      await new Promise((r) => setTimeout(r, 300));
-    } catch (err) {
-      console.error(`❌ [Parser] Ошибка (offset=${offset}):`, err);
-      break;
+    let gotAnything = false;
+    for (const [idx, res] of results.entries()) {
+      if (res.status === 'rejected') {
+        console.error(`❌ [Parser] Ошибка (offset=${batch[idx]}):`, res.reason);
+        continue;
+      }
+      if (!res.value.length) continue;
+      gotAnything = true;
+      all.push(
+        ...res.value
+          .map((item) => mapItem(item, type))
+          .filter((item): item is ParsedListing => item !== null),
+      );
     }
+
+    console.log(`📦 [Parser] Загружено ${all.length} (${type})`);
+
+    // Вся пачка пустая — дальше объявлений нет, дочитывать бессмысленно.
+    if (!gotAnything) break;
+    if (i + PAGE_CONCURRENCY < offsets.length) await new Promise((r) => setTimeout(r, 200));
   }
 
   return all.slice(0, maxItems);
 }
 
-async function saveListings(listings: ParsedListing[]): Promise<{ created: number; updated: number; newIds: number[] }> {
-  let created = 0, updated = 0;
-  const newIds: number[] = [];
+/** Сколько записей обновляем параллельно. По одной за раз тысяча объявлений
+ *  давала тысячи последовательных обращений к базе и выедала весь бюджет крона. */
+const WRITE_CONCURRENCY = 25;
 
-  for (const listing of listings) {
-    try {
-      const existing = await prisma.listing.findUnique({
-        where: { olxId: listing.olxId },
-        select: { id: true, priceNumeric: true, priceHistory: true },
-      });
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
 
-      if (existing) {
-        const priceHistory = (existing.priceHistory as unknown as PriceHistoryEntry[]) || [];
-        if (existing.priceNumeric !== listing.priceNumeric) {
-          priceHistory.push({ price: existing.priceNumeric, date: new Date().toISOString() });
+async function saveListings(
+  listings: ParsedListing[],
+): Promise<{ created: number; updated: number; newIds: number[] }> {
+  // OLX отдаёт одно и то же объявление на разных страницах (промо-блоки),
+  // поэтому сначала схлопываем — иначе createMany подавится дублями.
+  const unique = [...new Map(listings.map((l) => [l.olxId, l])).values()];
+  if (unique.length === 0) return { created: 0, updated: 0, newIds: [] };
+
+  // Один запрос вместо findUnique на каждое объявление.
+  const existing = await prisma.listing.findMany({
+    where: { olxId: { in: unique.map((l) => l.olxId) } },
+    select: { olxId: true, priceNumeric: true, priceHistory: true },
+  });
+  const known = new Map(existing.map((e) => [e.olxId, e]));
+
+  const toCreate = unique.filter((l) => !known.has(l.olxId));
+  const toUpdate = unique.filter((l) => known.has(l.olxId));
+
+  let created = 0;
+  let newIds: number[] = [];
+  if (toCreate.length > 0) {
+    const res = await prisma.listing.createMany({
+      data: toCreate.map((l) => ({ ...l, isMatched: false })),
+      skipDuplicates: true,
+    });
+    created = res.count;
+
+    // createMany не возвращает id — добираем отдельным запросом.
+    const saved = await prisma.listing.findMany({
+      where: { olxId: { in: toCreate.map((l) => l.olxId) } },
+      select: { id: true },
+    });
+    newIds = saved.map((s) => s.id);
+  }
+
+  let updated = 0;
+  for (const batch of chunk(toUpdate, WRITE_CONCURRENCY)) {
+    const results = await Promise.allSettled(
+      batch.map((listing) => {
+        const prev = known.get(listing.olxId)!;
+        const priceHistory = (prev.priceHistory as unknown as PriceHistoryEntry[]) || [];
+        // Историю пополняем только когда цена реально сдвинулась.
+        if (prev.priceNumeric !== listing.priceNumeric) {
+          priceHistory.push({ price: prev.priceNumeric, date: new Date().toISOString() });
         }
-        await prisma.listing.update({
+        return prisma.listing.update({
           where: { olxId: listing.olxId },
           data: { ...listing, priceHistory, isMatched: false },
         });
-        updated++;
-      } else {
-        const saved = await prisma.listing.create({ data: { ...listing, isMatched: false } });
-        newIds.push(saved.id);
-        created++;
-      }
-    } catch (err) {
-      console.error(`❌ Ошибка сохранения olxId=${listing.olxId}:`, err);
+      }),
+    );
+
+    for (const [i, res] of results.entries()) {
+      if (res.status === 'fulfilled') updated++;
+      else console.error(`❌ Ошибка сохранения olxId=${batch[i].olxId}:`, res.reason);
     }
   }
 
