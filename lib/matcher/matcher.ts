@@ -1,6 +1,52 @@
 import { prisma } from '@/lib/prisma';
 import { sendNotification } from './notification';
 
+/**
+ * Сколько уведомлений отправляем одному фильтру за один прогон.
+ * Проверяем мы все объявления, но новый фильтр может совпасть с сотнями сразу —
+ * без потолка человек получил бы их одним залпом. Остальные не теряются:
+ * они не помечены отправленными и уйдут в следующих циклах.
+ */
+const MAX_NOTIFICATIONS_PER_RUN = Number(process.env.MAX_NOTIFICATIONS_PER_RUN) || 10;
+
+/**
+ * Объявление считается свежим, если создано за последние столько часов.
+ * Окно должно быть заметно больше интервала крона, иначе объявление успеет
+ * состариться между прогонами и попадёт в хвост очереди вместо мгновенной отправки.
+ */
+const FRESH_WINDOW_HOURS = Number(process.env.FRESH_WINDOW_HOURS) || 3;
+
+/**
+ * Делит совпадения на то, что уходит прямо сейчас, и то, что ждёт следующего цикла.
+ *
+ * Свежие отправляем всегда — ради них бот и нужен. Остаток лимита отдаём
+ * САМЫМ СТАРЫМ из очереди: если брать только свежие, накопленный хвост никогда
+ * не всплывёт наверх и останется неотправленным навсегда.
+ *
+ * @param matched совпадения, отсортированные по убыванию даты создания
+ */
+export function pickBatch<T extends { createdAt: Date }>(
+  matched: T[],
+  limit = MAX_NOTIFICATIONS_PER_RUN,
+  now = Date.now(),
+): T[] {
+  const freshEdge = now - FRESH_WINDOW_HOURS * 60 * 60 * 1000;
+  const fresh = matched.filter((l) => l.createdAt.getTime() >= freshEdge);
+  const backlog = matched.filter((l) => l.createdAt.getTime() < freshEdge);
+
+  // Пока очередь не пуста, часть лимита за ней закреплена. Без этой брони
+  // всплеск свежих объявлений занял бы все слоты, и хвост не сдвинулся бы вообще.
+  const reserved = backlog.length > 0 ? Math.max(1, Math.floor(limit * 0.2)) : 0;
+
+  const batch = fresh.slice(0, limit - reserved);
+  const left = limit - batch.length;
+  // backlog отсортирован по убыванию даты, поэтому хвост массива — самые старые.
+  if (left > 0) batch.push(...backlog.slice(-left));
+
+  // Отправляем от старых к новым, чтобы самое свежее пришло последним (внизу чата).
+  return batch.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
 interface FilterCriteria {
   type: 'rent' | 'sale';
   district?: string;
@@ -257,7 +303,10 @@ export async function runMatching() {
           }
         : {};
 
-      // Берём 200 самых свежих подходящих объявлений (desc + take)
+      // Берём всех кандидатов, а не первые N. Критерии фильтра проверяются
+      // в памяти, поэтому обрезать выборку до проверки нельзя: подходящее
+      // объявление просто не дойдёт до matchesFilter. Ограничение стоит
+      // дальше — на количестве отправок, а не на количестве проверок.
       const candidates = await prisma.listing.findMany({
         where: {
           type: filter.type,
@@ -265,74 +314,82 @@ export async function runMatching() {
           ...districtFilter,
         },
         orderBy: { createdAt: 'desc' },
-        take: 200,
       });
-
-      // Отправляем от старых к новым, чтобы самое свежее объявление
-      // пришло в Telegram последним (внизу чата).
-      candidates.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
       console.log(
         `   кандидатов=${candidates.length} (с районом "${criteria.district}"), уже отправлено=${alreadySentIds.size}`,
       );
 
       const rejectReasons: Record<string, number> = {};
-      let filterMatchCount = 0;
 
+      // Сначала полный отбор, потом отправка.
+      const matched: typeof candidates = [];
       for (const listing of candidates) {
         if (alreadySentIds.has(listing.id)) continue;
 
+        const result = matchesFilter(listing, criteria);
+        if (result.match) {
+          matched.push(listing);
+        } else {
+          const key = (result.reason || 'неизвестно').split(':')[0];
+          rejectReasons[key] = (rejectReasons[key] || 0) + 1;
+        }
+      }
+
+      // Свежие уходят сразу, остаток лимита разгребает хвост очереди.
+      // Неотправленные не теряются: они не помечены и вернутся в следующий цикл.
+      const batch = pickBatch(matched);
+
+      const filterMatchCount = matched.length;
+      console.log(
+        `   совпало=${filterMatchCount}, отправляем в этом цикле=${batch.length}, ждут очереди=${matched.length - batch.length}`,
+      );
+
+      for (const listing of batch) {
         try {
-          const result = matchesFilter(listing, criteria);
+          console.log(`  ✅ СОВПАДЕНИЕ! → "${listing.title}" $${listing.priceNumeric}`);
 
-          if (result.match) {
-            filterMatchCount++;
-            console.log(`  ✅ СОВПАДЕНИЕ! → "${listing.title}" $${listing.priceNumeric}`);
+          const sent = await sendNotification(
+            {
+              id: filter.user.id,
+              chatId: filter.user.chatId,
+              firstName: filter.user.firstName,
+              lastName: filter.user.lastName,
+              username: filter.user.username,
+              telegramId: filter.user.telegramId,
+            },
+            listing,
+            filter,
+          );
 
-            const sent = await sendNotification(
-              {
-                id: filter.user.id,
-                chatId: filter.user.chatId,
-                firstName: filter.user.firstName,
-                lastName: filter.user.lastName,
-                username: filter.user.username,
-                telegramId: filter.user.telegramId,
-              },
-              listing,
-              filter,
+          // Помечаем как отправленное ТОЛЬКО при успехе.
+          // Иначе объявление останется и уйдёт в следующем цикле,
+          // а не потеряется навсегда.
+          if (!sent) {
+            console.warn(
+              `  ⏭️ Отправка не удалась — повторим в следующем цикле (listing #${listing.id})`,
             );
-
-            // Помечаем как отправленное ТОЛЬКО при успехе.
-            // Иначе объявление останется и уйдёт в следующем цикле,
-            // а не потеряется навсегда.
-            if (!sent) {
-              console.warn(`  ⏭️ Отправка не удалась — повторим в следующем цикле (listing #${listing.id})`);
-              continue;
-            }
-
-            await prisma.notification.create({
-              data: {
-                userId: filter.userId,
-                filterId: filter.id,
-                listingId: listing.id,
-              },
-            });
-
-            alreadySentIds.add(listing.id);
-            matchedCount++;
-
-            // Небольшая пауза между отправками, чтобы не ловить 429 от Telegram.
-            await new Promise((r) => setTimeout(r, 500));
-          } else {
-            const key = (result.reason || 'неизвестно').split(':')[0];
-            rejectReasons[key] = (rejectReasons[key] || 0) + 1;
+            continue;
           }
+
+          await prisma.notification.create({
+            data: {
+              userId: filter.userId,
+              filterId: filter.id,
+              listingId: listing.id,
+            },
+          });
+
+          alreadySentIds.add(listing.id);
+          matchedCount++;
+
+          // Небольшая пауза между отправками, чтобы не ловить 429 от Telegram.
+          await new Promise((r) => setTimeout(r, 500));
         } catch (err) {
           console.error(`  ❌ Ошибка листинг #${listing.id}:`, err);
         }
       }
 
-      console.log(`   Совпало: ${filterMatchCount}`);
       if (Object.keys(rejectReasons).length > 0) {
         console.log(`   Причины отсева:`, JSON.stringify(rejectReasons));
       }
