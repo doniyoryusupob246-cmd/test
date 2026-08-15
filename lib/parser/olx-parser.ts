@@ -195,11 +195,18 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
   if (!response.ok) {
     // Тело и заголовки ответа показывают, кто именно режет: Cloudflare, WAF OLX
     // или гео-фильтр. По одному коду 403 этого не понять.
-    const body = await response.text().catch(() => '');
-    const who = ['server', 'cf-ray', 'x-cache', 'via', 'content-type']
+    const raw = await response.text().catch(() => '');
+    // CloudFront отдаёт HTML-заглушку; причина написана обычным текстом между
+    // тегами, поэтому вырезаем разметку и оставляем только смысл.
+    const reason = raw
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    const who = ['server', 'x-cache', 'x-amz-cf-pop', 'via']
       .map((h) => `${h}=${response.headers.get(h) ?? '-'}`)
       .join(' ');
-    console.error(`🚫 [Parser] ${response.status} от OLX | ${who} | тело: ${body.slice(0, 300)}`);
+    console.error(`🚫 [Parser] ${response.status} | ${who} | причина: ${reason}`);
     throw new Error(`OLX API вернул ${response.status}: ${response.statusText}`);
   }
 
