@@ -227,9 +227,14 @@ async function parseCategory(type: 'rent' | 'sale', maxItems = 500): Promise<Par
   return all.slice(0, maxItems);
 }
 
-/** Сколько записей обновляем параллельно. По одной за раз тысяча объявлений
- *  давала тысячи последовательных обращений к базе и выедала весь бюджет крона. */
-const WRITE_CONCURRENCY = 25;
+/**
+ * Сколько записей обновляем параллельно. По одной за раз тысяча объявлений
+ * давала тысячи последовательных обращений к базе и выедала весь бюджет крона.
+ *
+ * Держим ниже размера пула соединений (pg.Pool по умолчанию 10), иначе запросы
+ * начинают ждать свободного коннекта, а через пулер Neon — рваться по таймауту.
+ */
+const WRITE_CONCURRENCY = Number(process.env.WRITE_CONCURRENCY) || 5;
 
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -254,25 +259,34 @@ async function saveListings(
 
   const toCreate = unique.filter((l) => !known.has(l.olxId));
   const toUpdate = unique.filter((l) => known.has(l.olxId));
+  console.log(`💾 [Parser] К записи: новых=${toCreate.length}, обновить=${toUpdate.length}`);
 
   let created = 0;
   let newIds: number[] = [];
   if (toCreate.length > 0) {
-    const res = await prisma.listing.createMany({
-      data: toCreate.map((l) => ({ ...l, isMatched: false })),
-      skipDuplicates: true,
-    });
-    created = res.count;
+    try {
+      const res = await prisma.listing.createMany({
+        data: toCreate.map((l) => ({ ...l, isMatched: false })),
+        skipDuplicates: true,
+      });
+      created = res.count;
 
-    // createMany не возвращает id — добираем отдельным запросом.
-    const saved = await prisma.listing.findMany({
-      where: { olxId: { in: toCreate.map((l) => l.olxId) } },
-      select: { id: true },
-    });
-    newIds = saved.map((s) => s.id);
+      // createMany не возвращает id — добираем отдельным запросом.
+      const saved = await prisma.listing.findMany({
+        where: { olxId: { in: toCreate.map((l) => l.olxId) } },
+        select: { id: true },
+      });
+      newIds = saved.map((s) => s.id);
+    } catch (err) {
+      // Не роняем всю категорию: обновления существующих ещё могут пройти.
+      console.error(`❌ [Parser] createMany упал на ${toCreate.length} записях:`, err);
+    }
   }
 
   let updated = 0;
+  let failed = 0;
+  let firstError: unknown = null;
+
   for (const batch of chunk(toUpdate, WRITE_CONCURRENCY)) {
     const results = await Promise.allSettled(
       batch.map((listing) => {
@@ -289,10 +303,18 @@ async function saveListings(
       }),
     );
 
-    for (const [i, res] of results.entries()) {
+    for (const res of results) {
       if (res.status === 'fulfilled') updated++;
-      else console.error(`❌ Ошибка сохранения olxId=${batch[i].olxId}:`, res.reason);
+      else {
+        failed++;
+        // Тысяча одинаковых стектрейсов в логе бесполезна — печатаем первый.
+        if (firstError === null) firstError = res.reason;
+      }
     }
+  }
+
+  if (failed > 0) {
+    console.error(`❌ [Parser] Не удалось обновить ${failed} из ${toUpdate.length}. Первая ошибка:`, firstError);
   }
 
   return { created, updated, newIds };
