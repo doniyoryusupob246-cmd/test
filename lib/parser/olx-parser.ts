@@ -192,15 +192,32 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
     signal: AbortSignal.timeout(20000),
   });
 
-  if (!response.ok) throw new Error(`OLX API вернул ${response.status}: ${response.statusText}`);
+  if (!response.ok) {
+    // Тело и заголовки ответа показывают, кто именно режет: Cloudflare, WAF OLX
+    // или гео-фильтр. По одному коду 403 этого не понять.
+    const body = await response.text().catch(() => '');
+    const who = ['server', 'cf-ray', 'x-cache', 'via', 'content-type']
+      .map((h) => `${h}=${response.headers.get(h) ?? '-'}`)
+      .join(' ');
+    console.error(`🚫 [Parser] ${response.status} от OLX | ${who} | тело: ${body.slice(0, 300)}`);
+    throw new Error(`OLX API вернул ${response.status}: ${response.statusText}`);
+  }
 
   const data = await response.json();
   return data?.data || [];
 }
 
-/** Сколько страниц OLX тянем одновременно. Последовательно 13 страниц с паузами
- *  занимали больше половины бюджета крона (30 с у cron-job.org). */
-const PAGE_CONCURRENCY = 5;
+/**
+ * Сколько страниц OLX тянем одновременно. Последовательно 13 страниц с паузами
+ * занимали больше половины бюджета крона (30 с у cron-job.org).
+ *
+ * Ставь 1, если OLX начал отдавать 403: всплеск одновременных запросов с одного
+ * IP может поднимать флаг у WAF перед их API.
+ */
+const PAGE_CONCURRENCY = Number(process.env.PAGE_CONCURRENCY) || 5;
+
+/** Пауза между пачками страниц. При PAGE_CONCURRENCY=1 играет роль вежливой задержки. */
+const PAGE_DELAY_MS = Number(process.env.PAGE_DELAY_MS) || 200;
 
 async function parseCategory(type: 'rent' | 'sale', maxItems = 500): Promise<ParsedListing[]> {
   const categoryId = CATEGORIES[type];
@@ -233,7 +250,7 @@ async function parseCategory(type: 'rent' | 'sale', maxItems = 500): Promise<Par
 
     // Вся пачка пустая — дальше объявлений нет, дочитывать бессмысленно.
     if (!gotAnything) break;
-    if (i + PAGE_CONCURRENCY < offsets.length) await new Promise((r) => setTimeout(r, 200));
+    if (i + PAGE_CONCURRENCY < offsets.length) await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
   }
 
   return all.slice(0, maxItems);
