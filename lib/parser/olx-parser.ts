@@ -173,9 +173,21 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
   const url = `${OLX_API}?offset=${offset}&limit=${limit}&category_id=${categoryId}&region_id=${REGION_ID}&city_id=${CITY_ID}&owner_type=private&currency=UZS&suggest_filters=true`;
 
   const response = await fetch(url, {
+    // OLX отдаёт 403 запросам, не похожим на браузер. Полный набор заголовков
+    // не спасает от бана по IP, но снимает часть проверок.
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36',
-      Accept: 'application/json',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'ru-RU,ru;q=0.9,uz;q=0.8,en;q=0.7',
+      Referer: 'https://www.olx.uz/nedvizhimost/kvartiry/tashkent/',
+      Origin: 'https://www.olx.uz',
+      'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
     },
     signal: AbortSignal.timeout(20000),
   });
@@ -352,8 +364,17 @@ export async function runParser(options?: {
     }
   }
 
-  const deleted = await cleanupOldListings(cleanupDays);
-  if (deleted > 0) console.log(`🧹 Удалено старых (>${cleanupDays} дней): ${deleted}`);
+  // Чистим только если этот прогон реально что-то принёс. Иначе при недоступном
+  // OLX (403, сеть, бан по IP) объявления перестают обновляться, протухают по
+  // lastSeenAt и вычищаются подчистую — база опустошается сама собой.
+  let deleted = 0;
+  if (totalCreated + totalUpdated > 0) {
+    deleted = await cleanupOldListings(cleanupDays);
+    if (deleted > 0) console.log(`🧹 Удалено старых (>${cleanupDays} дней): ${deleted}`);
+  } else {
+    console.warn('⚠️ [Parser] Ничего не загружено — чистку пропускаем, чтобы не опустошить базу');
+  }
+
   console.log(`🎉 Готово! Создано: ${totalCreated}, Обновлено: ${totalUpdated}, Удалено: ${deleted}`);
 
   return { created: totalCreated, updated: totalUpdated, deleted, newListingIds: allNewIds };
