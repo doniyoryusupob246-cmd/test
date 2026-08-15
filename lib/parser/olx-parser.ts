@@ -1,7 +1,66 @@
+import https from 'https';
 import { prisma } from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 
-const OLX_API = 'https://olx.uz/api/v1/offers/';
+// www обязателен: без него olx.uz отдаёт 301, а лишний редирект здесь не нужен.
+const OLX_API = 'https://www.olx.uz/api/v1/offers/';
+
+/**
+ * Порядок TLS-шифров, который отправляет Chrome.
+ *
+ * OLX стоит за CloudFront с AWS WAF, и тот снимает отпечаток TLS-рукопожатия.
+ * Набор шифров Node по умолчанию опознаётся как бот и получает 403
+ * "Request blocked" — независимо от заголовков, IP и хостинга. Проверено:
+ * с одной машины .NET проходит (200), а curl и Node падают (403).
+ * С этим списком Node проходит.
+ */
+const CHROME_CIPHERS = [
+  'TLS_AES_128_GCM_SHA256',
+  'TLS_AES_256_GCM_SHA384',
+  'TLS_CHACHA20_POLY1305_SHA256',
+  'ECDHE-ECDSA-AES128-GCM-SHA256',
+  'ECDHE-RSA-AES128-GCM-SHA256',
+  'ECDHE-ECDSA-AES256-GCM-SHA384',
+  'ECDHE-RSA-AES256-GCM-SHA384',
+  'ECDHE-ECDSA-CHACHA20-POLY1305',
+  'ECDHE-RSA-CHACHA20-POLY1305',
+  'ECDHE-RSA-AES128-SHA',
+  'ECDHE-RSA-AES256-SHA',
+  'AES128-GCM-SHA256',
+  'AES256-GCM-SHA384',
+  'AES128-SHA',
+  'AES256-SHA',
+].join(':');
+
+/**
+ * GET к OLX через https.request, а не через fetch: только так можно задать
+ * шифры для конкретного запроса. Глобально менять tls.DEFAULT_CIPHERS нельзя —
+ * это задело бы и соединение с Postgres, и вызовы Telegram.
+ */
+function olxGet(url: string, headers: Record<string, string>, timeoutMs = 20000) {
+  return new Promise<{ status: number; body: string; headers: Record<string, string | undefined> }>(
+    (resolve, reject) => {
+      const req = https.request(
+        url,
+        { method: 'GET', headers, ciphers: CHROME_CIPHERS, minVersion: 'TLSv1.2', timeout: timeoutMs },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () =>
+            resolve({
+              status: res.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString('utf8'),
+              headers: res.headers as Record<string, string | undefined>,
+            }),
+          );
+        },
+      );
+      req.on('timeout', () => req.destroy(new Error(`Таймаут ${timeoutMs} мс`)));
+      req.on('error', reject);
+      req.end();
+    },
+  );
+}
 
 // ✅ Правильные категории OLX
 const CATEGORIES = {
@@ -172,45 +231,30 @@ async function fetchPage(categoryId: number, offset: number, limit: number): Pro
   // ✅ owner_type=private — только частные объявления прямо в запросе
   const url = `${OLX_API}?offset=${offset}&limit=${limit}&category_id=${categoryId}&region_id=${REGION_ID}&city_id=${CITY_ID}&owner_type=private&currency=UZS&suggest_filters=true`;
 
-  const response = await fetch(url, {
-    // OLX отдаёт 403 запросам, не похожим на браузер. Полный набор заголовков
-    // не спасает от бана по IP, но снимает часть проверок.
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      Accept: 'application/json, text/plain, */*',
-      'Accept-Language': 'ru-RU,ru;q=0.9,uz;q=0.8,en;q=0.7',
-      Referer: 'https://www.olx.uz/nedvizhimost/kvartiry/tashkent/',
-      Origin: 'https://www.olx.uz',
-      'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
-    },
-    signal: AbortSignal.timeout(20000),
+  const response = await olxGet(url, {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'ru-RU,ru;q=0.9,uz;q=0.8,en;q=0.7',
+    Referer: 'https://www.olx.uz/nedvizhimost/kvartiry/tashkent/',
   });
 
-  if (!response.ok) {
-    // Тело и заголовки ответа показывают, кто именно режет: Cloudflare, WAF OLX
-    // или гео-фильтр. По одному коду 403 этого не понять.
-    const raw = await response.text().catch(() => '');
+  if (response.status < 200 || response.status >= 300) {
     // CloudFront отдаёт HTML-заглушку; причина написана обычным текстом между
     // тегами, поэтому вырезаем разметку и оставляем только смысл.
-    const reason = raw
+    const reason = response.body
       .replace(/<[^>]+>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 500);
-    const who = ['server', 'x-cache', 'x-amz-cf-pop', 'via']
-      .map((h) => `${h}=${response.headers.get(h) ?? '-'}`)
+    const who = ['server', 'x-cache', 'x-amz-cf-pop']
+      .map((h) => `${h}=${response.headers[h] ?? '-'}`)
       .join(' ');
     console.error(`🚫 [Parser] ${response.status} | ${who} | причина: ${reason}`);
-    throw new Error(`OLX API вернул ${response.status}: ${response.statusText}`);
+    throw new Error(`OLX API вернул ${response.status}`);
   }
 
-  const data = await response.json();
+  const data = JSON.parse(response.body);
   return data?.data || [];
 }
 
